@@ -17,8 +17,8 @@ LOG_LEVEL = "INFO"
 
 SERIAL_BAUD = 9600
 TIMEOUT = 1
-JARAK_LOCK = 30.0          # ≤ ini → LOCK
-JARAK_MENDEKAT = 50.0      # antara JARAK_LOCK dan ini → MENDEKAT
+JARAK_LOCK = 70.0          # ≤ ini → LOCK
+JARAK_MENDEKAT = 100.0     # antara JARAK_LOCK dan ini → MENDEKAT
 JARAK_MENJAUH = JARAK_LOCK       # > ini → mulai MENJAUH (sama dgn JARAK_LOCK)
 JARAK_RESET = JARAK_MENDEKAT     # > ini → reset ke IDLE (sama dgn JARAK_MENDEKAT)
 HEARTBEAT_DETIK = 1
@@ -48,40 +48,30 @@ def simulate_reading():
         return None
     _sim_last_report = now
 
-    # ─── LOCK zone (≤ 30 cm) ───
     if jarak >= 2 and jarak <= JARAK_LOCK:
         _sim_count = 0
-        just_entered = _sim_state != "LOCK"
         _sim_state = "LOCK"
-        if just_entered:
-            return f"LOCK | ADA objek terdeteksi | Jarak: {jarak} cm"
-        return f"LOCK | Objek masih ada | Jarak: {jarak} cm"
-
-    # ─── MENDEKAT zone (30–50 cm) ───
-    if jarak > JARAK_LOCK and jarak <= JARAK_MENDEKAT:
+    elif jarak > JARAK_LOCK and jarak <= JARAK_MENDEKAT:
         if _sim_state in ("LOCK", "MENJAUH"):
-            pass  # fall through to menjauh handling
+            pass
         else:
             _sim_count += 1
             if _sim_count >= MENDEKAT_BATAS:
                 _sim_state = "MENDEKAT"
-                return f"MENDEKAT | Ada objek mendekat | Jarak: {jarak} cm"
-            _sim_state = "IDLE"
-            return f"IDLE | TIDAK ADA objek | Jarak: {jarak} cm"
-
-    # ─── MENJAUH / IDLE zone (> 50 cm) ───
-    if _sim_state in ("LOCK", "MENJAUH"):
+            else:
+                _sim_state = "IDLE"
+    elif _sim_state in ("LOCK", "MENJAUH"):
         _sim_count += 1
         if _sim_count >= MENJAUH_BATAS:
             _sim_state = "IDLE"
             _sim_count = 0
-            return "UNLOCK | TIDAK ADA objek"
-        _sim_state = "MENJAUH"
-        return f"MENJAUH | Objek terlihat menjauh | Jarak: {jarak} cm | Hitungan: {_sim_count}/{MENJAUH_BATAS}"
+        else:
+            _sim_state = "MENJAUH"
+    else:
+        _sim_state = "IDLE"
+        _sim_count = 0
 
-    _sim_state = "IDLE"
-    _sim_count = 0
-    return f"IDLE | TIDAK ADA objek | Jarak: {jarak} cm"
+    return f"JARAK: {jarak} cm"
 
 
 
@@ -144,33 +134,42 @@ def setup_hardware():
 
 
 def parse_event(line):
-    state = "IDLE"
     jarak = None
-    sensor_error = "ERROR" in line or "DEBUG |" in line
+    sensor_error = ("ERROR" in line and "HC-SR04" in line) or "DEBUG |" in line
     menjauh_hitungan = None
 
-    if "LOCK" in line and "Jarak:" in line:
-        state = "LOCK"
+    # Format baru: "JARAK: 114.5 cm" or "JARAK: -1.0 cm" (out of range)
+    if "JARAK:" in line and "cm" in line:
+        jarak = float(line.replace("JARAK:", "").replace("cm", "").strip())
+        if jarak == 0.0:
+            jarak = -1.0
+        return "JARAK", jarak, sensor_error, menjauh_hitungan
+
+    # Format lama (backward compat)
+    if "ERROR" in line:
+        sensor_error = True
+    if "Jarak:" in line:
         jarak = float(line.split("Jarak:")[-1].replace("cm", "").strip())
-    elif "MENDEKAT" in line and "Jarak:" in line:
-        state = "MENDEKAT"
-        jarak = float(line.split("Jarak:")[-1].replace("cm", "").strip())
-    elif "MENJAUH" in line and "Jarak:" in line:
-        state = "MENJAUH"
-        jarak = float(line.split("Jarak:")[-1].split("|")[0].replace("cm", "").strip())
         if "Hitungan:" in line:
             try:
                 menjauh_hitungan = int(line.split("Hitungan:")[-1].split("/")[0].strip())
             except ValueError:
                 pass
-    elif "UNLOCK" in line:
-        state = "IDLE"
-    elif "IDLE" in line and "Jarak:" in line:
-        state = "IDLE"
-        jarak = float(line.split("Jarak:")[-1].replace("cm", "").strip())
+
+    if "UNLOCK" in line:
+        return "IDLE", jarak, sensor_error, menjauh_hitungan
+    if "LOCK" in line:
+        return "LOCK", jarak, sensor_error, menjauh_hitungan
+    if "MENDEKAT" in line:
+        return "MENDEKAT", jarak, sensor_error, menjauh_hitungan
+    if "MENJAUH" in line:
+        return "MENJAUH", jarak, sensor_error, menjauh_hitungan
+    if "IDLE" in line:
+        return "IDLE", jarak, sensor_error, menjauh_hitungan
+
     if jarak == 0.0:
-        sensor_error = True
-    return state, jarak, sensor_error, menjauh_hitungan
+        jarak = -1.0
+    return "IDLE", jarak, sensor_error, menjauh_hitungan
 
 
 def run_terminal():
@@ -225,6 +224,8 @@ class DistanceApp:
         self.durasi_detik = 0
         self.dot_count = 0
         self._reset_scheduled = False
+        self.mendekat_count = 0
+        self.menjauh_hitungan = 0
 
         win.title("Pengukur Jarak Digital")
         win.geometry("700x450")
@@ -443,7 +444,7 @@ class DistanceApp:
             ts = datetime.now().strftime("%H:%M:%S")
 
             if line:
-                state, jarak, sensor_error, menjauh_hitungan = parse_event(line)
+                msg_state, jarak, sensor_error, _ = parse_event(line)
 
                 if sensor_error:
                     print(f"[TERMINAL] [{ts}] [SENSOR ERROR] {line}", flush=True)
@@ -457,71 +458,95 @@ class DistanceApp:
                     self.win.after(100, self.update)
                     return
 
-                # ─────────── LOCK (<= 30 cm) ───────────
-                if state == "LOCK" and jarak is not None:
-                    if self.state != "LOCK":
-                        self.lock_start = time.time()
-                        self.state = "LOCK"
-                        self.lbl_ambient_title.config(text="Baseline")
-                        self.lbl_status_icon.config(text="[O] LOCKED", fg=self.FG_GREEN)
-                        self.lbl_status_bar.config(
-                            text="Status: [O] Locked", fg=self.FG_GREEN
-                        )
-                        print(f"[STATUS] [{ts}] [O] LOCKED", flush=True)
-                        print(f"[TERMINAL] [{ts}] [DETEKSI] LOCK | ADA objek terdeteksi | Jarak: {jarak} cm", flush=True)
+                if jarak is not None:
+                    if jarak <= 0:
+                        self.update_log(line, ts)
+                        self.win.after(100, self.update)
+                        return
 
-                    self.obj_jarak = jarak
-                    self.durasi_detik = int(time.time() - self.lock_start)
-                    durasi_str = f"{self.durasi_detik // 60:02d}:{self.durasi_detik % 60:02d}"
-                    self.set_right_lock(jarak, ts)
-                    self.lbl_durasi.config(text=f"Durasi: {durasi_str}")
+                    JL = JARAK_LOCK
+                    JM = JARAK_MENDEKAT
 
-                    if self.baseline is not None:
-                        delta = self.baseline - jarak
-                        self.lbl_delta.config(
-                            text=f"Delta: {delta:+.1f} cm", fg=self.FG_GREEN
-                        )
-                        print(f"[TERMINAL] [{ts}] [DETEKSI] LOCK | Durasi: {durasi_str} | Jarak: {jarak} cm | Delta: {delta:+.1f} cm", flush=True)
+                    # ─── LOCK zone (≤ 70 cm) ───
+                    if jarak >= 2 and jarak <= JL:
+                        self.mendekat_count = 0
+                        if self.state != "LOCK":
+                            if self.baseline is None:
+                                self.baseline = jarak
+                                print(f"[TERMINAL] [{ts}] [BASE] Baseline (dari LOCK): {jarak} cm", flush=True)
+                            self.menjauh_hitungan = 0
+                            self.lock_start = time.time()
+                            self.state = "LOCK"
+                            self.lbl_ambient_title.config(text="Baseline")
+                            self.lbl_status_icon.config(text="[O] LOCKED", fg=self.FG_GREEN)
+                            self.lbl_status_bar.config(
+                                text="Status: [O] Locked", fg=self.FG_GREEN
+                            )
+                            print(f"[STATUS] [{ts}] [O] LOCKED", flush=True)
+                            print(f"[TERMINAL] [{ts}] [DETEKSI] LOCK | ADA objek terdeteksi | Jarak: {jarak} cm", flush=True)
 
-                # ─────────── MENDEKAT (30-50 cm) ───────────
-                elif state == "MENDEKAT" and jarak is not None:
-                    self.state = "MENDEKAT"
-                    self.lbl_status_bar.config(
-                        text="Status: [V] Object mendekat", fg=self.FG_YELLOW
-                    )
-                    self.lbl_status_icon.config(text="[V] MENDEKAT", fg=self.FG_YELLOW)
-                    self.set_right_mendekat(jarak, ts)
-                    print(f"[STATUS] [{ts}] [V] MENDEKAT", flush=True)
-                    print(f"[TERMINAL] [{ts}] [DETEKSI] MENDEKAT | Ada objek mendekat | Jarak: {jarak} cm", flush=True)
+                        self.obj_jarak = jarak
+                        self.durasi_detik = int(time.time() - self.lock_start)
+                        durasi_str = f"{self.durasi_detik // 60:02d}:{self.durasi_detik % 60:02d}"
+                        self.set_right_lock(jarak, ts)
+                        self.lbl_durasi.config(text=f"Durasi: {durasi_str}")
 
-                # ─────────── MENJAUH (> 30 cm, counting to UNLOCK) ───────────
-                elif state == "MENJAUH" and jarak is not None:
-                    if self.state in ("LOCK", "MENJAUH", "MENDEKAT"):
-                        self.state = "MENJAUH"
-                        self.lbl_status_bar.config(
-                            text=f"Status: [^] Object menjauh ({menjauh_hitungan or '?'}/{MENJAUH_BATAS})", fg=self.FG_YELLOW
-                        )
-                        self.lbl_status_icon.config(text="[^] MENJAUH", fg=self.FG_YELLOW)
-                        self.set_right_menjauh(jarak, menjauh_hitungan, ts)
-                        print(f"[STATUS] [{ts}] [^] MENJAUH ({menjauh_hitungan or '?'}/{MENJAUH_BATAS})", flush=True)
-                        print(f"[TERMINAL] [{ts}] [DETEKSI] MENJAUH | Jarak: {jarak} cm | Hitungan: {menjauh_hitungan or '?'}/{MENJAUH_BATAS}", flush=True)
+                        if self.baseline is not None:
+                            delta = self.baseline - jarak
+                            self.lbl_delta.config(
+                                text=f"Delta: {delta:+.1f} cm", fg=self.FG_GREEN
+                            )
+                            print(f"[TERMINAL] [{ts}] [DETEKSI] LOCK | Durasi: {durasi_str} | Jarak: {jarak} cm | Delta: {delta:+.1f} cm", flush=True)
 
-                # ─────────── IDLE (> 50 cm, no object) ───────────
-                elif state == "IDLE":
-                    if self.state in ("LOCK", "MENJAUH", "MENDEKAT"):
-                        self.state = "IDLE"
-                        self.lbl_status_bar.config(
-                            text="Status: [!] Unstable", fg=self.FG_YELLOW
-                        )
-                        self.lbl_status_icon.config(text="[!] UNSTABLE", fg=self.FG_YELLOW)
-                        self.set_left_panel_idle()
-                        self.set_right_reset()
-                        self._reset_scheduled = True
-                        print(f"[STATUS] [{ts}] [!] UNSTABLE", flush=True)
-                        print(f"[TERMINAL] [{ts}] [DETEKSI] RESET | Objek hilang, loading 3 detik...", flush=True)
-                        self.win.after(3000, self.reset_to_idle)
+                    # ─── FROM LOCK/MENJAUH: moving away ───
+                    elif self.state in ("LOCK", "MENJAUH"):
+                        self.mendekat_count = 0
+                        self.menjauh_hitungan += 1
+                        hit = self.menjauh_hitungan
+                        if hit >= MENJAUH_BATAS:
+                            self.menjauh_hitungan = 0
+                            self.state = "IDLE"
+                            self.lbl_status_bar.config(
+                                text="Status: [!] Unstable", fg=self.FG_YELLOW
+                            )
+                            self.lbl_status_icon.config(text="[!] UNSTABLE", fg=self.FG_YELLOW)
+                            self.set_left_panel_idle()
+                            self.set_right_reset()
+                            self._reset_scheduled = True
+                            print(f"[STATUS] [{ts}] [!] UNLOCK", flush=True)
+                            print(f"[TERMINAL] [{ts}] [DETEKSI] UNLOCK | Objek hilang, loading 3 detik...", flush=True)
+                            self.win.after(3000, self.reset_to_idle)
+                        else:
+                            self.state = "MENJAUH"
+                            self.lbl_status_bar.config(
+                                text=f"Status: [^] Object menjauh ({hit}/{MENJAUH_BATAS})", fg=self.FG_YELLOW
+                            )
+                            self.lbl_status_icon.config(text="[^] MENJAUH", fg=self.FG_YELLOW)
+                            self.set_right_menjauh(jarak, hit, ts)
+                            print(f"[STATUS] [{ts}] [^] MENJAUH ({hit}/{MENJAUH_BATAS})", flush=True)
+                            print(f"[TERMINAL] [{ts}] [DETEKSI] MENJAUH | Jarak: {jarak} cm | Hitungan: {hit}/{MENJAUH_BATAS}", flush=True)
 
-                    if jarak is not None:
+                    # ─── MENDEKAT zone (70-100 cm) from IDLE ───
+                    elif jarak > JL and jarak <= JM:
+                        self.mendekat_count += 1
+                        if self.mendekat_count >= MENDEKAT_BATAS:
+                            self.mendekat_count = 0
+                            self.menjauh_hitungan = 0
+                            self.state = "MENDEKAT"
+                            self.lbl_status_bar.config(
+                                text="Status: [V] Object mendekat", fg=self.FG_YELLOW
+                            )
+                            self.lbl_status_icon.config(text="[V] MENDEKAT", fg=self.FG_YELLOW)
+                            self.set_right_mendekat(jarak, ts)
+                            print(f"[STATUS] [{ts}] [V] MENDEKAT", flush=True)
+                            print(f"[TERMINAL] [{ts}] [DETEKSI] MENDEKAT | Ada objek mendekat | Jarak: {jarak} cm", flush=True)
+                        else:
+                            self.lbl_ambient_val.config(text=f"{jarak} cm", fg=self.FG)
+                            print(f"[TERMINAL] [{ts}] [BASE] Jarak ambient: {jarak} cm", flush=True)
+
+                    # ─── IDLE zone (> 100 cm) ───
+                    else:
+                        self.mendekat_count = 0
                         if self.baseline is None:
                             self.baseline = jarak
                             print(f"[TERMINAL] [{ts}] [BASE] Baseline awal: {jarak} cm", flush=True)

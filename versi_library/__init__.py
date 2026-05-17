@@ -12,33 +12,42 @@ except ImportError:
 
 
 def parse_event(line):
-    state = "IDLE"
     jarak = None
-    sensor_error = "ERROR" in line
+    sensor_error = "ERROR" in line and "HC-SR04" in line
     menjauh_hitungan = None
 
-    if "LOCK" in line and "Jarak:" in line:
-        state = "LOCK"
+    # Format baru: "JARAK: 114.5 cm" or "JARAK: -1.0 cm" (out of range)
+    if "JARAK:" in line and "cm" in line:
+        jarak = float(line.replace("JARAK:", "").replace("cm", "").strip())
+        if jarak == 0.0:
+            jarak = -1.0
+        return "JARAK", jarak, sensor_error, menjauh_hitungan
+
+    # Format lama (backward compat)
+    if "ERROR" in line:
+        sensor_error = True
+    if "Jarak:" in line:
         jarak = float(line.split("Jarak:")[-1].replace("cm", "").strip())
-    elif "MENDEKAT" in line and "Jarak:" in line:
-        state = "MENDEKAT"
-        jarak = float(line.split("Jarak:")[-1].replace("cm", "").strip())
-    elif "MENJAUH" in line and "Jarak:" in line:
-        state = "MENJAUH"
-        jarak = float(line.split("Jarak:")[-1].split("|")[0].replace("cm", "").strip())
         if "Hitungan:" in line:
             try:
                 menjauh_hitungan = int(line.split("Hitungan:")[-1].split("/")[0].strip())
             except ValueError:
                 pass
-    elif "UNLOCK" in line:
-        state = "IDLE"
-    elif "IDLE" in line and "Jarak:" in line:
-        state = "IDLE"
-        jarak = float(line.split("Jarak:")[-1].replace("cm", "").strip())
+
+    if "UNLOCK" in line:
+        return "IDLE", jarak, sensor_error, menjauh_hitungan
+    if "LOCK" in line:
+        return "LOCK", jarak, sensor_error, menjauh_hitungan
+    if "MENDEKAT" in line:
+        return "MENDEKAT", jarak, sensor_error, menjauh_hitungan
+    if "MENJAUH" in line:
+        return "MENJAUH", jarak, sensor_error, menjauh_hitungan
+    if "IDLE" in line:
+        return "IDLE", jarak, sensor_error, menjauh_hitungan
+
     if jarak == 0.0:
-        sensor_error = True
-    return state, jarak, sensor_error, menjauh_hitungan
+        jarak = -1.0
+    return "IDLE", jarak, sensor_error, menjauh_hitungan
 
 
 class UltrasonicSensor:
@@ -46,8 +55,8 @@ class UltrasonicSensor:
         self.config = {
             "port": kwargs.get("port", None),
             "baud": kwargs.get("baud", 9600),
-            "jarak_lock": kwargs.get("jarak_lock", 30.0),
-            "jarak_mendekat": kwargs.get("jarak_mendekat", 50.0),
+            "jarak_lock": kwargs.get("jarak_lock", 20.0),
+            "jarak_mendekat": kwargs.get("jarak_mendekat", 40.0),
             "heartbeat_detik": kwargs.get("heartbeat_detik", 1),
             "mendekat_batas": kwargs.get("mendekat_batas", 2),
             "menjauh_batas": kwargs.get("menjauh_batas", 5),
@@ -63,6 +72,7 @@ class UltrasonicSensor:
         self._baseline = None
         self._durasi_detik = 0
         self._menjauh_hitungan = 0
+        self._mendekat_count = 0
         self._sensor_error = False
         self._lock_start = None
         self._running = False
@@ -201,16 +211,14 @@ class UltrasonicSensor:
             return None
         self._sim_last_report = now
 
-        # LOCK zone
         if jarak >= 2 and jarak <= JL:
             self._sim_count = 0
             just_entered = self._sim_state != "LOCK"
             self._sim_state = "LOCK"
             if just_entered:
-                return f"LOCK | ADA objek terdeteksi | Jarak: {jarak} cm"
-            return f"LOCK | Objek masih ada | Jarak: {jarak} cm"
+                return f"JARAK: {jarak} cm"
+            return f"JARAK: {jarak} cm"
 
-        # MENDEKAT zone
         if jarak > JL and jarak <= JM:
             if self._sim_state in ("LOCK", "MENJAUH"):
                 pass
@@ -218,23 +226,22 @@ class UltrasonicSensor:
                 self._sim_count += 1
                 if self._sim_count >= DB:
                     self._sim_state = "MENDEKAT"
-                    return f"MENDEKAT | Ada objek mendekat | Jarak: {jarak} cm"
-                self._sim_state = "IDLE"
-                return f"IDLE | TIDAK ADA objek | Jarak: {jarak} cm"
+                else:
+                    self._sim_state = "IDLE"
+                return f"JARAK: {jarak} cm"
 
-        # MENJAUH / IDLE zone
         if self._sim_state in ("LOCK", "MENJAUH"):
             self._sim_count += 1
             if self._sim_count >= JB:
                 self._sim_state = "IDLE"
                 self._sim_count = 0
-                return "UNLOCK | TIDAK ADA objek"
-            self._sim_state = "MENJAUH"
-            return f"MENJAUH | Objek terlihat menjauh | Jarak: {jarak} cm | Hitungan: {self._sim_count}/{JB}"
+            else:
+                self._sim_state = "MENJAUH"
+            return f"JARAK: {jarak} cm"
 
         self._sim_state = "IDLE"
         self._sim_count = 0
-        return f"IDLE | TIDAK ADA objek | Jarak: {jarak} cm"
+        return f"JARAK: {jarak} cm"
 
     def _get_line(self):
         if not self.config["use_real_hardware"]:
@@ -256,38 +263,58 @@ class UltrasonicSensor:
 
     def _process_line(self, line):
         ts = datetime.now().strftime("%H:%M:%S")
-        state, jarak, sensor_error, menjauh_hitungan = parse_event(line)
+        msg_state, jarak, sensor_error, menjauh_hitungan = parse_event(line)
 
         if sensor_error:
             self._set_state(state="ERROR", jarak=None, sensor_error=True)
             return
 
+        if jarak is None or jarak <= 0:
+            return
+
         self._sensor_error = False
         JL = self.config["jarak_lock"]
+        JM = self.config["jarak_mendekat"]
+        DB = self.config["mendekat_batas"]
         JB = self.config["menjauh_batas"]
 
-        if state == "LOCK" and jarak is not None:
+        if jarak >= 2 and jarak <= JL:
+            self._mendekat_count = 0
             if self._state != "LOCK":
-                self._lock_start = time.time()
-                self._set_state(state="LOCK", durasi_detik=0)
-            self._set_state(jarak=jarak, menjauh_hitungan=0)
-            if self._lock_start:
-                self._set_state(durasi_detik=int(time.time() - self._lock_start))
-
-        elif state == "MENDEKAT" and jarak is not None:
-            self._set_state(state="MENDEKAT", jarak=jarak, menjauh_hitungan=0)
-
-        elif state == "MENJAUH" and jarak is not None:
-            if self._state in ("LOCK", "MENJAUH", "MENDEKAT"):
-                self._set_state(state="MENJAUH", jarak=jarak, menjauh_hitungan=menjauh_hitungan)
-
-        elif state == "IDLE":
-            if self._state in ("LOCK", "MENJAUH", "MENDEKAT"):
-                self._set_state(state="IDLE", jarak=jarak, durasi_detik=0, menjauh_hitungan=0)
-            if jarak is not None:
                 if self._baseline is None:
-                    self._set_state(baseline=jarak)
+                    self._baseline = jarak
+                self._menjauh_hitungan = 0
+                self._lock_start = time.time()
+                self._set_state(state="LOCK", jarak=jarak, durasi_detik=0, menjauh_hitungan=0)
+            else:
                 self._set_state(jarak=jarak)
+                if self._lock_start:
+                    self._set_state(durasi_detik=int(time.time() - self._lock_start))
+
+        elif self._state in ("LOCK", "MENJAUH"):
+            self._mendekat_count = 0
+            menjauh = self._menjauh_hitungan + 1
+            if menjauh >= JB:
+                self._menjauh_hitungan = 0
+                self._set_state(state="IDLE", jarak=jarak, durasi_detik=0, menjauh_hitungan=0)
+            else:
+                self._menjauh_hitungan = menjauh
+                self._set_state(state="MENJAUH", jarak=jarak, menjauh_hitungan=menjauh)
+
+        elif jarak > JL and jarak <= JM:
+            self._mendekat_count += 1
+            if self._mendekat_count >= DB:
+                self._mendekat_count = 0
+                self._menjauh_hitungan = 0
+                self._set_state(state="MENDEKAT", jarak=jarak, menjauh_hitungan=0)
+            else:
+                self._set_state(state="IDLE", jarak=jarak)
+
+        else:
+            self._mendekat_count = 0
+            if self._baseline is None:
+                self._baseline = jarak
+            self._set_state(state="IDLE", jarak=jarak)
 
     def _run(self):
         try:
